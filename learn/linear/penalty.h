@@ -36,9 +36,21 @@ class L1L2 {
   inline T Solve(T z, T eta) {
     // soft-thresholding
     CHECK_GT(eta, 0);
+    // LOG(INFO) << "Current lambda_l1 " << lambda1_ << "\n";
     if (z <= lambda1_ && z >= -lambda1_) return 0;
     return (z > 0 ? z - lambda1_ : z + lambda1_) / (eta + lambda2_);
   }
+
+    inline T Solve_with_occurence(T z, T eta, T l1_factor, T l2_factor) {
+      // soft-thresholding
+      CHECK_GT(eta, 0);
+      // LOG(INFO) << "Current lambda_l1 " << lambda1_ << "\n"
+        T l1 = lambda1_ * l1_factor;
+        T l2 = lambda2_ * l2_factor;
+      if (z <= l1 && z >= -l1) return 0;
+      return (z > 0 ? z - l1 : z + l1) / (eta + l2);
+    }
+
  private:
   T lambda1_, lambda2_;
 };
