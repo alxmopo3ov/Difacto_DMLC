@@ -16,7 +16,6 @@ namespace difacto {
 #define BIAS_KEY 14437434782623107211ull
 
 
-
 /**
 * \brief the scheduler for async SGD
 */
@@ -102,10 +101,14 @@ struct ISGDHandle {
     struct Embedding {
         Config::Embedding::Algo_V algo_v = Config::Embedding::ADAGRAD_V;
         int dim = 0;
-        unsigned thr;
+        unsigned thr, thr_step;
         float lambda_l1 = 0, lambda_l2 = 0;
         float alpha = .01, beta = 1;
-        float V_min = -0.01, V_max = .01;
+        float V_min = -0.01f, V_max = .01;
+        float lambda_l1_2 = 0;
+        float lr_nu = 0.999;
+        float momentum_mu = 0.9;
+        bool l1_2_only_small = true;
     };
     Embedding V;
     bool l1_shrk;
@@ -157,31 +160,57 @@ struct AdaGradEntry {
     ~AdaGradEntry() { Clear(); }
 
     inline void Clear() {
-        if ( size > 1 ) { delete [] w; delete [] sqc_grad; }
-        size = 0; w = NULL; sqc_grad = NULL;
+        if ( size > 1 ) {
+            delete [] w;
+            delete [] sqc_grad;
+            delete [] z_V;
+            delete [] nag_prev;
+        }
+        size = 0;
+        w = NULL;
+        sqc_grad = NULL;
+        z_V = NULL;
+        nag_prev = NULL;
     }
 
-    //May be time consuming and inefficient. Maybe it is worth to store flag
-    //and do not free memory?..
     inline void Resize(int n) {
         if (n < size) {
             size = n;
             return;
         }
 
-        float* new_w = new float[n]; float* new_cg = new float[n+1];
+        float* new_w = new float[n];
+        float* new_cg = new float[n+1];
+        float* new_z_V = new float[n-1];
+        float* new_nag_prev = new float[n-1];
+
         if (size == 1) {
-            new_w[0] = w_0(); new_cg[0] = sqc_grad_0(); new_cg[1] = z_0();
+            new_w[0] = w_0();
+            new_cg[0] = sqc_grad_0();
+            new_cg[1] = z_0();
         } else {
             memcpy(new_w, w, size * sizeof(float));
             memcpy(new_cg, sqc_grad, (size+1) * sizeof(float));
+            memcpy(new_z_V, z_V, (size-1) * sizeof(float));
+            memcpy(new_nag_prev, nag_prev, (size-1) * sizeof(float));
             Clear();
         }
-        w = new_w; sqc_grad = new_cg; size = n;
+        w = new_w;
+        sqc_grad = new_cg;
+        z_V = new_z_V;
+        nag_prev = new_nag_prev;
+        size = n;
     }
 
     inline float& w_0() { return size == 1 ? *(float *)&w : w[0]; }
     inline float w_0() const { return size == 1 ? *(float *)&w : w[0]; }
+
+    // Pure L1/2 regularization is intractable, because in this case we must
+    // initialize all weight first and store them in memory. Hence, there is no
+    // good alternative for l1-shrinking as for memory constraints heuristic.
+    //
+    // However, we can still use L1/2 as additional regularization term for
+    // already initialized embeddings.
 
     inline float& sqc_grad_0() {
         return size == 1 ? *(float *)&sqc_grad : sqc_grad[0];
@@ -246,12 +275,26 @@ struct AdaGradEntry {
     /// FIXME: this is redundant and must be replaced with more memory-efficient storing only z
     float *z_V = NULL;
 
+    /// This is storage for prevous weights for nesterov accelerated gradient with reverse proximal function
+    /// FIXME: Too much memory required!
+    float *nag_prev = NULL;
+
     /// square root of the cumulative gradient
     float *sqc_grad = NULL;
 
     friend bool operator<(const AdaGradEntry & a, const AdaGradEntry & b) {
         return fabs(a.w_0()) < fabs(b.w_0());
     }
+
+    // TEMPORARY!
+    float momentum_mu_power = 1.0f;
+    float lr_nu_power = 1.0f;
+
+    // THIS IS DUPLICATE OF PREVOUS PARAMETERS!! Because w and V meet simultaneously
+    float lr_nu_power_w = 1.0f;
+    float momentum_mu_power_w = 1.0f;
+
+    bool is_active_embedding = false;
 };
 
 /**
@@ -297,30 +340,56 @@ struct AdaGradHandle : public ISGDHandle {
     /// \brief resize if necessary
     inline void Resize(AdaGradEntry& val, FeaID key) {
         // resize the larger dim first to avoid double resize
-        if (val.fea_cnt > V.thr && val.size < V.dim + 1 &&
+        if (val.fea_cnt >= V.thr && val.size < V.dim + 1 &&
             (!l1_shrk || val.w_0() != 0) && (learn_bias_embedding || key != (FeaID)BIAS_KEY)) {
+
             int old_siz = val.size;
-            val.Resize(V.dim + 1);
-            if (V.algo_v == Config::Embedding::FTRL_V || V.algo_v == Config::Embedding::FTRL_dmlc) {
-                val.z_V = new float [V.dim];
+            if (!V.thr_step) {
+                val.Resize(V.dim + 1);
+            } else {
+                val.Resize(std::min(val.fea_cnt + 1, std::min(val.size + V.thr_step, (unsigned)V.dim + 1)));
             }
+
             for (int j = old_siz; j < val.size; ++j) {
                 val.w[j] = rand() / (float) RAND_MAX * (V.V_max - V.V_min) + V.V_min;
                 val.sqc_grad[j+1] = 0;
             }
 
-            if (V.algo_v == Config::Embedding::FTRL_V || V.algo_v == Config::Embedding::FTRL_dmlc) {
-                for (int i = 0; i < V.dim; i++) {
-//                    float w = -( V.alpha / V.beta + V.lambda_l2) * val.w[i+1];
-//                    if(w > 0) {
-//                        val.z_V[i] = w + V.lambda_l1;
-//                    } else {
-//                        val.z_V[i] = w - V.lambda_l1;
-//                    }
-                    val.z_V[i] = 0.0;
+            for(int i = old_siz; i < val.size; i++) {
+                if (val.z_V) {
+                    val.z_V[i - 1] = 0.0;
+                }
+                if (val.nag_prev) {
+                    val.nag_prev[i - 1] = 0.0;
                 }
             }
-            new_V += val.size - old_siz;
+
+            if (val.size == V.dim + 1) {
+                for (int j = 1; j < val.size; ++j) {
+                    val.w[j] = rand() / (float) RAND_MAX * (V.V_max - V.V_min) + V.V_min;
+                    val.sqc_grad[j + 1] = 0;
+                    if (val.z_V) {
+                        val.z_V[j - 1] = 0.0;
+                    }
+                    if (val.nag_prev) {
+                        val.nag_prev[j - 1] = 0.0;
+                    }
+                }
+
+                // this should be consistent with prevous setting
+                if(V.l1_2_only_small) {
+                    new_V += V.dim;
+                }
+            }
+        }
+    }
+
+    inline void recalculate_new_V(unsigned size, bool is_active_now, bool was_active_before)
+    {
+        if(!is_active_now && was_active_before) {
+            new_V -= size;
+        } else if(is_active_now && !was_active_before) {
+            new_V += size;
         }
     }
 
@@ -333,6 +402,8 @@ struct AdaGradHandle : public ISGDHandle {
             UpdateW_FTRL_My(val, g, key);
         } else if (algo_w == Config::FTRL_dmlc) {
             UpdateW_FTRL_dmlc(val, g, key);
+        } else if(algo_w == Config::FTRL_dmlc_RMSProp) {
+            UpdateW_FTRL_dmlc_RMSProp(val, g, key);
         }
     }
 
@@ -344,15 +415,7 @@ struct AdaGradHandle : public ISGDHandle {
         float cg = val.sqc_grad_0();
         val.sqc_grad_0() = (float) sqrt(cg * cg + g * g );
         float eta = alpha / (beta + val.sqc_grad_0());
-
-
-        if (fabs(-g + 1.0f / eta * w) < lambda_l1) {
-            val.w_0() = 0;
-        } else if (-g + 1.0f / eta * w > lambda_l1) {
-            val.w_0() = (-g + 1.0f / eta * w - lambda_l1) / (lambda_l2 + 1.0f / eta);
-        } else {
-            val.w_0() = (-g + 1.0f / eta * w + lambda_l1) / (lambda_l2 + 1.0f / eta);
-        }
+        val.w_0() = solve_proximal_operator(-g + w / eta, eta, lambda_l1, lambda_l2);
 
         if(w == 0 && val.w_0() != 0) {
             ++ new_w; Resize(val, key);
@@ -364,27 +427,14 @@ struct AdaGradHandle : public ISGDHandle {
     //FTRL with adaptive addition of regularization
     inline void UpdateW_FTRL_My(AdaGradEntry& val, float g, FeaID key) {
         float w = val.w_0();
-        // g += lambda_l2 * w;
-
-        float l1 = lambda_l1 * val.minibatch_occurence_count;
-        float l2 = lambda_l2 * val.minibatch_occurence_count;
+        unsigned occ = val.minibatch_occurence_count;
 
         float cg = val.sqc_grad_0();
-        float cg_new = sqrt( cg * cg + g * g );
+        float cg_new = (float)sqrt( cg * cg + g * g );
         val.sqc_grad_0() = cg_new;
 
-        val.z_0() -= g - (cg_new - cg) / alpha * w;
-
-        float z = val.z_0();
-        if (z <= l1  && z >= - l1) {
-            val.w_0() = 0;
-            //Shrink(val, key);
-        } else {
-            // float eta = (beta + cg_new) / alpha;
-            float eta = (beta + cg_new) / alpha + l2;
-            val.w_0() = (z > 0 ? z - l1 : z + l1) / eta;
-            //Resize(val, key);
-        }
+        val.z_0() += g - (cg_new - cg) / alpha * w;
+        val.w_0() = solve_proximal_operator(- val.z_0(), alpha / (cg_new + beta), lambda_l1 * occ, lambda_l2 * occ);
 
         if(w == 0 && val.w_0() != 0) {
             ++ new_w; Resize(val, key);
@@ -396,51 +446,83 @@ struct AdaGradHandle : public ISGDHandle {
 
     inline void UpdateW_FTRL_dmlc(AdaGradEntry& val, float g, FeaID key) {
         float w = val.w_0();
-        // g += lambda_l2 * w;
-
-        float l1 = lambda_l1;
-        float l2 = lambda_l2;
 
         float cg = val.sqc_grad_0();
-        float cg_new = sqrt( cg * cg + g * g );
+        float cg_new = (float)sqrt( cg * cg + g * g );
         val.sqc_grad_0() = cg_new;
 
-        val.z_0() -= g - (cg_new - cg) / alpha * w;
+        val.z_0() += g - (cg_new - cg) / alpha * w;
+        val.w_0() = solve_proximal_operator(- val.z_0(), alpha / (cg_new + beta), lambda_l1, lambda_l2);
 
-        float z = val.z_0();
-        if (z <= l1  && z >= - l1) {
-            val.w_0() = 0;
-            //Shrink(val, key);
-        } else {
-            // float eta = (beta + cg_new) / alpha;
-            float eta = (beta + cg_new) / alpha + l2;
-            val.w_0() = (z > 0 ? z - l1 : z + l1) / eta;
-            //Resize(val, key);
-        }
-
+        Resize(val, key);
         if(w == 0 && val.w_0() != 0) {
-            ++ new_w; Resize(val, key);
+            ++ new_w;
         } else if(w != 0 && val.w_0() == 0) {
             -- new_w;
         }
     }
 
+    inline void UpdateW_FTRL_dmlc_RMSProp(AdaGradEntry& val, float g, FeaID key) {
+        val.lr_nu_power_w *= V.lr_nu;
+        float w = val.w_0();
+
+        // temporary crutch for initial bias correction term
+        float cg = val.sqc_grad_0();
+        float n_t_prev;
+        if(val.lr_nu_power_w < V.lr_nu) {
+            n_t_prev = (float) sqrt((cg / (1.0f - val.lr_nu_power_w / V.lr_nu)));
+        } else {
+            n_t_prev = 0;
+        }
+        cg = V.lr_nu * cg + (1.0f - V.lr_nu) * g * g;
+        float n_t_cur = (float) sqrt(cg / (1.0f - val.lr_nu_power_w));
+        val.sqc_grad_0() = cg;
+        val.z_0() += g - (n_t_cur - n_t_prev) / V.alpha * w;
+        val.w_0() = solve_proximal_operator(- val.z_0(), alpha / (n_t_cur + beta), lambda_l1, lambda_l2);
+
+        Resize(val, key);
+        if(w == 0 && val.w_0() != 0) {
+            ++ new_w;
+        } else if(w != 0 && val.w_0() == 0) {
+            -- new_w;
+        }
+    }
+
+    // boolean parameter is optional by now
+    inline std::vector<float> solve_proximal_operator_group(float *z, float *cg, float l1, float l2, float l1_2,
+                                                            size_t n, bool *active)
+    {
+        double cum_z = .0f;
+        for(int i = 0; i < n; i++) {
+            cum_z += z[i] * z[i];
+        }
+        if (sqrt(cum_z) < l1_2 * sqrt(n)) {
+            recalculate_new_V(n, false, *active);
+            *active = false;
+            return std::vector<float> (n);
+        } else {
+            std::vector<float> w(n);
+            float eta = .0f;
+            for(int i = 0; i < n; i++) {
+                eta = (float) (V.alpha / (cg[i] + V.beta));
+                // FIXME! minus!
+                w[i] = - (float) ((1.0f / (l2 + 1.0f / eta)) * (1.0f - l1_2 / sqrt(cum_z)) * z[i]);
+            }
+            recalculate_new_V(n, true, *active);
+            *active = true;
+            return w;
+        }
+    }
 
     // Solves FTRL Proximal Operator and return weight
-    inline float solve_ftrl_proximal(float z, float cg_new, float l1, float l2, float alpha, float beta)
+    inline float solve_proximal_operator(float z, float eta, float l1, float l2)
     {
-        //FILE *f = fopen("./ahaha_learn_rates.log", "a+");
         float w;
         if (z <= l1  && z >= - l1) {
             w = 0;
-            //Shrink(val, key);
         } else {
-            // float eta = (beta + cg_new) / alpha;
-            float eta = (beta + cg_new) / alpha;// + l2;
-            //fprintf(f, "%f %f\n", eta, 1.0f / eta);
-            w = - (z > 0 ? z - l1 : z + l1) / eta;
+            w = (z > 0 ? z - l1 : z + l1) / (l2 + 1.0f / eta);
         }
-        //fclose(f);
         return w;
     }
 
@@ -451,10 +533,174 @@ struct AdaGradHandle : public ISGDHandle {
         } else if (V.algo_v == Config::Embedding::ADAGRAD_V) {
             adagrad_proximal_UpdateV(val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1);
         } else if (V.algo_v == Config::Embedding::FTRL_V) {
-            ftrl_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.minibatch_occurence_count);
+            ftrl_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                         val.minibatch_occurence_count, val.size, &val.is_active_embedding);
         } else if (V.algo_v == Config::Embedding::FTRL_dmlc) {
-            ftrl_dmlc_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.minibatch_occurence_count);
-        };
+            ftrl_dmlc_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                              val.minibatch_occurence_count, val.size, &val.is_active_embedding);
+        } else if (V.algo_v == Config::Embedding::RMSProp) {
+            val.lr_nu_power *= V.lr_nu;
+            rmsprop_UpdateV(val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.lr_nu_power);
+        } else if (V.algo_v == Config::Embedding::ADAM) {
+            val.momentum_mu_power *= V.momentum_mu;
+            val.lr_nu_power *= V.lr_nu;
+            adam_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power, val.lr_nu_power);
+        } else if (V.algo_v == Config::Embedding::NAG) {
+            val.momentum_mu_power *= V.momentum_mu;
+            nag_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power);
+        } else if (V.algo_v == Config::Embedding::NAG_prox_momentum) {
+            val.momentum_mu_power *= V.momentum_mu;
+            nag_reverse_prox_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power);
+        } else if (V.algo_v == Config::Embedding::MOMENTUM) {
+            val.momentum_mu_power *= V.momentum_mu;
+            momentum_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power);
+        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_RMSProp) {
+            val.lr_nu_power *= V.lr_nu;
+            ftrl_rmsprop_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                                 val.minibatch_occurence_count, val.lr_nu_power,
+                                 &val.is_active_embedding);
+        } else if (V.algo_v == Config::Embedding::NADAM) {
+            val.momentum_mu_power *= V.momentum_mu;
+            val.lr_nu_power *= V.lr_nu;
+            nadam_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power, val.lr_nu_power);
+        } else if (V.algo_v == Config::Embedding::NADAM_prox_momentum) {
+            val.momentum_mu_power *= V.momentum_mu;
+            val.lr_nu_power *= V.lr_nu;
+            nadam_reverse_prox_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                                       val.momentum_mu_power, val.lr_nu_power);
+        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_adam) {
+            val.momentum_mu_power *= V.momentum_mu;
+            val.lr_nu_power *= V.lr_nu;
+            ftrl_adam_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                              val.minibatch_occurence_count, val.momentum_mu_power,
+                              val.lr_nu_power, &val.is_active_embedding);
+        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_nadam) {
+            val.momentum_mu_power *= V.momentum_mu;
+            val.lr_nu_power *= V.lr_nu;
+            ftrl_nadam_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
+                              val.minibatch_occurence_count, val.momentum_mu_power,
+                              val.lr_nu_power, &val.is_active_embedding);
+        }
+    }
+
+    // Classic momentum gradient descence with ADAGRAD learning rates
+    inline void momentum_UpdateV(float* m, float* w, float* cg, float const* g, int n, float momentum_mu_power) {
+        // bias corrected (requires usual learning rates)
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            m[i] = V.momentum_mu * m[i] + grad;
+
+            cg[i] = (float) sqrt(cg[i] * cg[i] + grad * grad);
+            float eta = V.alpha / (cg[i] + V.beta);
+            float bias_correction = (float) ((1.0f - momentum_mu_power) / (1.0f - V.momentum_mu));
+            w[i] = solve_proximal_operator(-m[i] / bias_correction + w[i] / eta,
+                                           eta, V.lambda_l1, V.lambda_l2);
+        }
+    }
+
+    // RMSProp stochastic optimization method with bias correction
+    inline void rmsprop_UpdateV(float* w, float* cg, float const* g, int n, float lr_nu_power) {
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t = (float) (cg[i] / (1.0f - lr_nu_power));
+            float eta = (float) (V.alpha / (sqrt(n_t) + V.beta));
+            w[i] = solve_proximal_operator(-g[i] + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+        }
+    }
+
+    // Adam stochastic optimization method
+    inline void adam_UpdateV(float* m, float* w, float* cg, float const* g, int n,
+                             float momentum_mu_power, float lr_nu_power) {
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t = (float) (cg[i] / (1.0f - lr_nu_power));
+            float eta = (float) (V.alpha / (sqrt(n_t) + V.beta));
+
+            m[i] = V.momentum_mu * m[i] + (1.0f - V.momentum_mu) * grad;
+            float m_t = (float) (m[i] / (1.0f - momentum_mu_power));
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+        }
+    }
+
+    // Nesterov Accelerated Gradient. Shows superior performance on word2vec
+    // it will be good to get bias correction here
+    //
+    // bias_correction:
+    inline void nag_UpdateV(float* m, float* w, float* cg, float const* g, int n, float momentum_mu_power) {
+        // bias corrected (and magnitude too)
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            w[i] += V.alpha / (cg[i] + V.beta) * V.momentum_mu * m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            cg[i] = (float) sqrt(cg[i] * cg[i] + grad * grad);
+            float eta = V.alpha / ( cg[i] + V.beta );
+
+            m[i] = V.momentum_mu * m[i] + grad;
+            float m_t = m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+            w[i] -= eta * V.momentum_mu * m[i] / (1.0f - momentum_mu_power * V.momentum_mu) * (1 - V.momentum_mu);
+        }
+    }
+
+    inline void nag_reverse_prox_UpdateV(float *prev_w, float* m, float* w, float* cg, float const* g, int n, float momentum_mu_power) {
+        // bias corrected (and magnitude too)
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            w[i] = prev_w[i];
+            cg[i] = (float) sqrt(cg[i] * cg[i] + grad * grad);
+            float eta = V.alpha / ( cg[i] + V.beta );
+
+            m[i] = V.momentum_mu * m[i] + grad;
+            float m_t = m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+            prev_w[i] = w[i];
+            m_t = V.momentum_mu * m[i] / (1.0f - momentum_mu_power * V.momentum_mu) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+        }
+    }
+
+
+    //Adam with Nesterov Momentum and bias correction (some experiments must be carried out!)
+    // For example, we have to solve reverse proximal operator for this kind of method
+    inline void nadam_UpdateV(float* m, float* w, float* cg, float const* g, int n,
+                              float momentum_mu_power, float lr_nu_power) {
+
+        // bias corrected (and magnitude too)
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            w[i] += V.alpha / (cg[i] + V.beta) * V.momentum_mu * m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            // RMSProp learning rate
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t = (float) (cg[i] / (1.0f - lr_nu_power));
+            float eta = (float) (V.alpha / (sqrt(n_t) + V.beta));
+
+            m[i] = V.momentum_mu * m[i] + grad;
+            float m_t = m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+            w[i] -= eta * V.momentum_mu * m[i] / (1.0f - momentum_mu_power * V.momentum_mu) * (1 - V.momentum_mu);
+        }
+    }
+
+    inline void nadam_reverse_prox_UpdateV(float *prev_w, float* m, float* w, float* cg, float const* g, int n,
+                                           float momentum_mu_power, float lr_nu_power)
+    {
+        // bias corrected (and magnitude too)
+        for (int i = 0; i < n; ++i) {
+            float grad = g[i];
+            w[i] = prev_w[i];
+            // RMSProp learning rate
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t = (float) (cg[i] / (1.0f - lr_nu_power));
+            float eta = (float) (V.alpha / (sqrt(n_t) + V.beta));
+
+            m[i] = V.momentum_mu * m[i] + grad;
+            float m_t = m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+            prev_w[i] = w[i];
+            m_t = V.momentum_mu * m[i] / (1.0f - momentum_mu_power * V.momentum_mu) * (1 - V.momentum_mu);
+            w[i] = solve_proximal_operator(-m_t + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
+        }
     }
 
 
@@ -468,57 +714,204 @@ struct AdaGradHandle : public ISGDHandle {
         }
     }
 
+
     // adagrad with proximal L2 regularization. There is no l1 regularization here! Experiments are wrong!!
     inline void adagrad_proximal_UpdateV(float* w, float* cg, float const* g, int n) {
         for (int i = 0; i < n; ++i) {
             float grad = g[i];
             cg[i] = (float) sqrt(cg[i] * cg[i] + grad * grad);
             float eta = V.alpha / ( cg[i] + V.beta );
-
-            // Solve proximal operator for l1 regularization
-            if (fabs(-g[i] + w[i] / eta) < V.lambda_l1) {
-                w[i] = 0;
-            } else if (-g[i] + w[i] / eta > V.lambda_l1) {
-                w[i] = (-g[i] + w[i] / eta - V.lambda_l1) / (V.lambda_l2 + 1.0f / eta);
-            } else {
-                w[i] = (-g[i] + w[i] / eta + V.lambda_l1) / (V.lambda_l2 + 1.0f / eta);
-            }
+            w[i] = solve_proximal_operator(-g[i] + w[i] / eta, eta, V.lambda_l1, V.lambda_l2);
         }
     }
+
 
     // FTRL Proximal My update
     // FIXME: Currently we store both z and w, but instead we can store only z
     // FIXME: Produces different learning curves in comparision with adagrad update. This is wrong!
-    inline void ftrl_UpdateV(float* z_v, float *w, float* cg, float const* g, int n, unsigned minibatch_occurence) {
+    inline void ftrl_UpdateV(float* z_v, float *w, float* cg, float const* g, int n,
+                             unsigned minibatch_occurence, unsigned size, bool* active) {
         for (int i = 0; i < n; i++) {
             float grad = g[i];
             float cg_old = cg[i];
             float cg_new = (float) sqrt(cg_old * cg_old + grad * grad);
             z_v[i] += grad - (cg_new - cg_old) / V.alpha * w[i];
-
-            float l1 = V.lambda_l1 * minibatch_occurence;
-            float l2 = V.lambda_l2 * minibatch_occurence;
-
-            w[i] = solve_ftrl_proximal(z_v[i], cg_new, l1, l2, V.alpha, V.beta);
             cg[i] = cg_new;
+        }
+
+        float l1 = V.lambda_l1 * minibatch_occurence;
+        float l2 = V.lambda_l2 * minibatch_occurence;
+        float l1_2 = V.lambda_l1_2 * minibatch_occurence;
+
+
+        // fail, because to the moment
+        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
+            auto res_w = solve_proximal_operator_group(z_v, cg, l1, l2, l1_2, n, active);
+            for (int i = 0; i < n; i++) {
+                w[i] = res_w[i];
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (cg[i] + V.beta), l1, l2);
+            }
         }
     }
 
     // FTRL-DMLC Proximal update
-    // Needs to be fixed
-    inline void ftrl_dmlc_UpdateV(float* z_v, float *w, float* cg, float const* g, int n, unsigned minibatch_occurence) {
+    inline void ftrl_dmlc_UpdateV(float* z_v, float *w, float* cg, float const* g, int n,
+                                  unsigned minibatch_occurence, unsigned size, bool* active) {
         for (int i = 0; i < n; i++) {
             float grad = g[i];
             float cg_old = cg[i];
             float cg_new = (float) sqrt(cg_old * cg_old + grad * grad);
             z_v[i] += grad - (cg_new - cg_old) / V.alpha * w[i];
-
-            float l1 = V.lambda_l1;
-            float l2 = V.lambda_l2;
-
-            w[i] = solve_ftrl_proximal(z_v[i], cg_new, l1, l2, V.alpha, V.beta);
             cg[i] = cg_new;
         }
+
+        float l1 = V.lambda_l1;
+        float l2 = V.lambda_l2;
+        float l1_2 = V.lambda_l1_2;
+
+
+        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
+            auto res_w = solve_proximal_operator_group(z_v, cg, l1, l2, l1_2, n, active);
+            for (int i = 0; i < n; i++) {
+                w[i] = res_w[i];
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (cg[i] + V.beta), l1, l2);
+            }
+        }
+    }
+
+    // FTRL-Proximal with RMSProp learning rates
+    inline void ftrl_rmsprop_UpdateV(float* z_v, float *w, float* cg, float const* g, int n,
+                                     unsigned minibatch_occurence, float lr_nu_power, bool* active) {
+        float *n_t = new float [n];
+        for (int i = 0; i < n; i++) {
+            float grad = g[i];
+
+            // temporary crutch for initial bias correction term
+            float n_t_prev;
+            if(lr_nu_power < V.lr_nu) {
+                n_t_prev = (float) sqrt((cg[i] / (1.0f - lr_nu_power / V.lr_nu)));
+            } else {
+                n_t_prev = 0;
+            }
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t_cur = (float) sqrt(cg[i] / (1.0f - lr_nu_power));
+            n_t[i] = n_t_cur;
+            z_v[i] += grad - (n_t_cur - n_t_prev) / V.alpha * w[i];
+        }
+
+        float l1 = V.lambda_l1;
+        float l2 = V.lambda_l2;
+        float l1_2 = V.lambda_l1_2;
+
+
+        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
+            auto res_w = solve_proximal_operator_group(z_v, n_t, l1, l2, l1_2, n, active);
+            for (int i = 0; i < n; i++) {
+                w[i] = res_w[i];
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (n_t[i] + V.beta), l1, l2);
+            }
+        }
+        delete[] n_t;
+    }
+
+    /// I wish my equations are right...
+    inline void ftrl_adam_UpdateV(float *m, float *z_v, float *w, float *cg, float const* g, int n,
+                                  unsigned minibatch_occurence, float momentum_mu_power,
+                                  float lr_nu_power, bool *active)
+    {
+        float *n_t = new float [n];
+        for (int i = 0; i < n; i++) {
+            float grad = g[i];
+
+            // temporary crutch for initial bias correction term
+            float n_t_prev;
+            if(lr_nu_power < V.lr_nu) {
+                n_t_prev = (float) sqrt((cg[i] / (1.0f - lr_nu_power / V.lr_nu)));
+            } else {
+                n_t_prev = 0;
+            }
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t_cur = (float) sqrt(cg[i] / (1.0f - lr_nu_power));
+            n_t[i] = n_t_cur;
+            /// ADAM! Woohoo!
+            m[i] = V.momentum_mu * m[i] + (1 - V.momentum_mu) * grad;
+            z_v[i] += m[i] / (1.0f - momentum_mu_power) - (n_t_cur - n_t_prev) / V.alpha * w[i];
+        }
+
+
+        float l1 = V.lambda_l1;
+        float l2 = V.lambda_l2;
+        float l1_2 = V.lambda_l1_2;
+
+
+        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
+            auto res_w = solve_proximal_operator_group(z_v, n_t, l1, l2, l1_2, n, active);
+            for (int i = 0; i < n; i++) {
+                w[i] = res_w[i];
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (n_t[i] + V.beta), l1, l2);
+            }
+        }
+        delete[] n_t;
+    }
+
+
+    inline void ftrl_nadam_UpdateV(float *m, float *z_v, float *w, float *cg, float const* g, int n,
+                                  unsigned minibatch_occurence, float momentum_mu_power,
+                                  float lr_nu_power, bool *active)
+    {
+        float *n_t = new float [n];
+        for (int i = 0; i < n; i++) {
+            float grad = g[i];
+            // Subtracting nesterov momentum here
+            z_v[i] -= V.momentum_mu * m[i] / (1.0f - momentum_mu_power) * (1 - V.momentum_mu);
+
+            // temporary crutch for initial bias correction term
+            float n_t_prev;
+            if(lr_nu_power < V.lr_nu) {
+                n_t_prev = (float) sqrt((cg[i] / (1.0f - lr_nu_power / V.lr_nu)));
+            } else {
+                n_t_prev = 0;
+            }
+            cg[i] = V.lr_nu * cg[i] + (1.0f - V.lr_nu) * grad * grad;
+            float n_t_cur = (float) sqrt(cg[i] / (1.0f - lr_nu_power));
+            n_t[i] = n_t_cur;
+            /// ADAM! Woohoo!
+            m[i] = V.momentum_mu * m[i] + (1 - V.momentum_mu) * grad;
+            z_v[i] += m[i] / (1.0f - momentum_mu_power) - (n_t_cur - n_t_prev) / V.alpha * w[i];
+
+            // Incorporating nesterov momentum here
+            z_v[i] += V.momentum_mu * m[i] / (1.0f - momentum_mu_power * V.momentum_mu) * (1 - V.momentum_mu);
+        }
+
+
+        float l1 = V.lambda_l1;
+        float l2 = V.lambda_l2;
+        float l1_2 = V.lambda_l1_2;
+
+
+        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
+            auto res_w = solve_proximal_operator_group(z_v, n_t, l1, l2, l1_2, n, active);
+            for (int i = 0; i < n; i++) {
+                w[i] = res_w[i];
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (n_t[i] + V.beta), l1, l2);
+            }
+        }
+        delete[] n_t;
     }
 };
 
@@ -541,15 +934,20 @@ public:
         // for V
         if (conf.embedding_size() > 0) {
             const auto& c = conf.embedding(0);
-            h.V.dim       = c.dim();
-            h.V.thr       = (unsigned)c.threshold();
-            h.V.lambda_l2 = c.lambda_l2();
-            h.V.lambda_l2 = c.lambda_l1();
-            h.V.V_min     = - c.init_scale();
-            h.V.V_max     = c.init_scale();
-            h.V.alpha     = c.has_lr_eta() ? c.lr_eta() : h.alpha;
-            h.V.beta      = c.has_lr_beta() ? c.lr_beta() : h.beta;
-            h.V.algo_v    = c.algo_v();
+            h.V.dim         = c.dim();
+            h.V.thr         = (unsigned)c.threshold();
+            h.V.thr_step    = (unsigned)c.threshold_step();
+            h.V.lambda_l2   = c.lambda_l2();
+            h.V.lambda_l2   = c.lambda_l1();
+            h.V.V_min       = - c.init_scale();
+            h.V.V_max       = c.init_scale();
+            h.V.alpha       = c.has_lr_eta() ? c.lr_eta() : h.alpha;
+            h.V.beta        = c.has_lr_beta() ? c.lr_beta() : h.beta;
+            h.V.algo_v      = c.algo_v();
+            h.V.lambda_l1_2 = c.lambda_l1_2();
+            h.V.lr_nu       = c.lr_nu();
+            h.V.momentum_mu = c.momentum_mu();
+            h.V.l1_2_only_small = c.l1_2_only_small();
         }
 
         Server s(h, 1, 1, ps::NextID(), conf_.max_keys());

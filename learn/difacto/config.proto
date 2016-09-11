@@ -64,7 +64,37 @@ message Config {
 
       /// FTRL-DMLC Style
       FTRL_dmlc = 4;
-    }
+
+      // RMSProp learning rates with proximal l1 and l2 updates
+      RMSProp = 5;
+
+      // Generally, adam requires all gradients. They also must be in momentum. But i think i can try proximal version
+      ADAM = 6;
+
+      // Nesterov Accelerated Gradient with proximal updates
+      NAG = 7;
+
+      // Classic Momentum with proximal l1 and l2 updates
+      MOMENTUM = 8;
+
+      // FTRL with RMSProp learning rates
+      FTRL_dmlc_RMSProp = 9;
+
+      // Nesterov Accelerated gradient with double proximal operator
+      NAG_prox_momentum = 10;
+
+      // Nesterov Adaptive Moment Estimation
+      NADAM = 11;
+
+      // Nesterov Adaptive Moment Estimation with double proximal operator
+      NADAM_prox_momentum = 12;
+
+      //FTRL-Proximal with adam updates
+      FTRL_dmlc_adam = 13;
+
+      //FTRL-Proximal with nadam updates
+      FTRL_dmlc_nadam = 14;
+  }
 
     optional Algo_V algo_v = 151 [default = ADAGRAD_V];
 
@@ -73,6 +103,9 @@ message Config {
 
     /// features with occurence < threshold have no embedding (:math:`k=0`)
     optional int32 threshold = 2;
+
+    /// threshold step for small embeddings initialization
+    optional int32 threshold_step = 14 [default = 0];
 
     /// l2 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
     optional float lambda_l2 = 3;
@@ -102,6 +135,18 @@ message Config {
 
     /// l2 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
     optional float lambda_l1 = 10  [default = 0];
+
+    /// l1/2 regularizer for :math:`V`, may be used instead (or with) l1 shrinking heuristic
+    optional float lambda_l1_2 = 11 [default = 0];
+
+    /// learning rate momentum (for RMSProp & Adam)
+    optional float lr_nu = 12 [default = 0.999];
+
+    /// momentum for cumulative gradients (for all momentum methods)
+    optional float momentum_mu = 13 [default = 0.9];
+
+    /// group sparsity only for rate embeddings (recommended)
+    optional bool l1_2_only_small = 15 [default = true];
   }
 
   /// the learning method
@@ -112,6 +157,12 @@ message Config {
     FTRL_W = 2;
     /// FTRL Which was in DiFacto when i got it
     FTRL_dmlc = 3;
+    /// FTRL-dmlc with RMSProp learning rates
+    FTRL_dmlc_RMSProp = 4;
+    /// FTRL-Proximal with adam update
+    // FTRL_dmlc_adam = 5;
+    /// FTRL-Proximal with nadam update
+    // FTRL_dmlc_nadam = 6;
   }
 
   /// the learning method, default is FTRL
