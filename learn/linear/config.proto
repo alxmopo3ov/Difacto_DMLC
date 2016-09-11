@@ -61,6 +61,8 @@ message Config {
     ADAGRAD = 2;
     /// similar to ADAGRAD, but use FTRL for better sparsity
     FTRL = 3;
+    /// My ftrl update to enforce convergence
+    FTRL_my = 4;
   }
 
   /// the learning method, default is FTRL

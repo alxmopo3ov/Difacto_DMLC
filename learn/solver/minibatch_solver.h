@@ -198,6 +198,7 @@ class MinibatchScheduler : public IterScheduler {
   // return true if it's time for stopping
   bool ShowProgress(bool is_train) {
     auto prog = GetProgress();
+    if (prog.empty()) return false;  // no progress...
     auto disp = ProgString(prog);
     if (disp.empty()) return false;  // no progress...
     printf("%5.0lf  %s\n", GetTime() - start_time_, disp.c_str());

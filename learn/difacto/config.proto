@@ -19,8 +19,14 @@ message Config {
   /// model output filename
   optional string model_out = 5;
 
+  /// full state model output filename
+  optional string full_state_model_out = 129;
+
   /// model input filename
   optional string model_in = 7;
+
+  /// full state model input filename
+  optional string full_state_model_in = 130;
 
   /// the filename for prediction output. if specified, then run
   /// prediction. otherwise run training
@@ -46,14 +52,63 @@ message Config {
   message Embedding {
     /// -- model --
 
+    enum Algo_V {
+      /// Original DiFacto update. Cannot be combined with l1 regularization
+      ADAGRAD_V_LINEARIZED = 1;
+
+      /// COMID DiFacto update (proximal l2 regularizer). Cannot be combined with l1 regularization
+      ADAGRAD_V = 2;
+
+      /// FTRL with incremental adaptive multiplycation by factor of minibatch occurencies of this feature
+      FTRL = 3;
+
+      // RMSProp learning rates with proximal l1 and l2 updates
+      RMSProp = 5;
+
+      // Generally, adam requires all gradients. They also must be in momentum. But i think i can try proximal version
+      ADAM = 6;
+
+      // Nesterov Accelerated Gradient with proximal updates
+      NAG = 7;
+
+      // Classic Momentum with proximal l1 and l2 updates
+      MOMENTUM = 8;
+
+      // FTRL with RMSProp learning rates
+      FTRL_RMSProp = 9;
+
+      // Nesterov Accelerated gradient with double proximal operator
+      NAG_prox_momentum = 10;
+
+      // Nesterov Adaptive Moment Estimation
+      NADAM = 11;
+
+      // Nesterov Adaptive Moment Estimation with double proximal operator
+      NADAM_prox_momentum = 12;
+
+      //FTRL-Proximal with adam updates
+      FTRL_adam = 13;
+
+      //FTRL-Proximal with nadam updates
+      FTRL_nadam = 14;
+  }
+
+    optional Algo_V algo_v = 151 [default = ADAGRAD_V];
+
     /// the embedding dimension :math:`k`
     optional int32 dim = 1;
 
     /// features with occurence < threshold have no embedding (:math:`k=0`)
     optional int32 threshold = 2;
 
+    /// threshold step for small embeddings initialization
+    optional int32 threshold_step = 14 [default = 0];
+
     /// l2 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
     optional float lambda_l2 = 3;
+
+    /// Incremental l2 regularizer for V
+    optional float lambda_l2_incremental = 16 [default = 0];
 
     /// -- learning --
 
@@ -77,7 +132,50 @@ message Config {
 
     /// normalized the l2-norm of gradient of :math:`V`. no in default
     optional float grad_normalization = 9 [default = 0];
+
+    /// l1 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
+    optional float lambda_l1 = 10  [default = 0];
+
+    /// l1 incremental regularizer (makes sense only when l1/2 is inactive)
+    optional float lambda_l1_incremental = 17 [default = 0];
+
+    /// l1/2 regularizer for :math:`V`, may be used instead (or with) l1 shrinking heuristic
+    optional float lambda_l1_2 = 11 [default = 0];
+
+    /// Incremental l1/2 regularizer for V
+    optional float lambda_l1_2_incremental = 18 [default = 0];
+
+    /// learning rate momentum (for RMSProp & Adam)
+    optional float lr_nu = 12 [default = 0.999];
+
+    /// momentum for cumulative gradients (for all momentum methods)
+    optional float momentum_mu = 13 [default = 0.9];
+
+    /// group sparsity only for rare embeddings (recommended)
+    optional bool l1_2_only_small = 15 [default = true];
   }
+
+  /// the learning method
+  enum Algo_W {
+    /// asynchronous minibatch SGD
+    ADAGRAD_W = 1;
+    /// similar to SGD, but use adagrad
+    FTRL_W = 2;
+    /// FTRL Which was in DiFacto when i got it
+    FTRL_dmlc = 3;
+    /// FTRL-dmlc with RMSProp learning rates
+    FTRL_dmlc_RMSProp = 4;
+    /// FTRL-Proximal with adam update
+    // FTRL_dmlc_adam = 5;
+    /// FTRL-Proximal with nadam update
+    // FTRL_dmlc_nadam = 6;
+  }
+
+  /// Learning rate decay for RMSProp
+  optional float lr_nu_w = 151 [default = 0.999];
+
+  /// the learning method, default is FTRL
+  optional Algo_W algo_w = 150 [default = FTRL_W];
 
   /// the embedding :math:`V`
   repeated Embedding embedding = 15;
@@ -142,6 +240,9 @@ message Config {
   /// use or not use the contraint :math:`V_i = 0` if :math:`w_i = 0`. yes in default
   optional bool l1_shrk = 114 [default = true];
 
+  /// Whether free or not memory for V_i when w_i = 0. off in default
+  optional bool learn_bias_embedding = 131 [default = false];
+
   /// optional bool grad_normalization = 115 [default = false];
 
   /// - system performance -
@@ -164,4 +265,10 @@ message Config {
   /// convert floating-points into fixed-point integers with n bytes. n can be 1,
   /// 2 and 3. 0 means no compression.
   optional int32 fixed_bytes = 125 [default = 0];
+  message NamespaceSet {
+    repeated uint32 namespace_idxs = 1;
+  }
+  repeated NamespaceSet learn_namespaces = 126;
+  optional float add_key_probability = 127;
+  optional uint64 max_keys = 128 [default = 0];
 }

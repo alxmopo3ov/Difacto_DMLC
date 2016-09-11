@@ -37,6 +37,97 @@ class BinClassEval {
     return area < 0.5 ? 1 - area : area;
   }
 
+  // In the future, we will make one AUC function returning all AUCs to avoid double sorting
+  V AUC_PR() {
+    size_t n = size_;
+    struct Entry { V label; V predict; };
+    std::vector<Entry> buff(n);
+    for (size_t i = 0; i < n; ++i) {
+      buff[i].label = label_[i];
+      buff[i].predict = predict_[i];
+    }
+    //reverse sort
+    std::sort(buff.data(), buff.data()+n,  [](const Entry& a, const Entry&b) {
+        return a.predict > b.predict; });
+    size_t true_predicted_labels = 0;
+    V cumulative_precision = 0.0;
+    for(size_t i = 0; i < n; ++i) {
+      if (buff[i].label > 0) {
+        true_predicted_labels++;
+        cumulative_precision += (V)true_predicted_labels / (i + 1);
+      }
+    }
+    return cumulative_precision / true_predicted_labels;
+  }
+
+  std::vector <V> AUC_all() {
+    size_t n = size_;
+    struct Entry { V label; V predict; };
+    std::vector<Entry> buff(n);
+    for (size_t i = 0; i < n; ++i) {
+      buff[i].label = label_[i];
+      buff[i].predict = predict_[i];
+    }
+    std::sort(buff.data(), buff.data()+n,  [](const Entry& a, const Entry&b) {
+        return a.predict < b.predict; });
+    V area = 0, cum_tp = 0;
+    for (size_t i = 0; i < n; ++i) {
+      if (buff[i].label > 0) {
+        cum_tp += 1;
+      } else {
+        area += cum_tp;
+      }
+    }
+    if (cum_tp == 0 || cum_tp == n) area = 1;
+    area /= cum_tp * (n - cum_tp);
+    area = area < 0.5 ? 1 - area : area;
+    
+    
+    size_t true_predicted_labels = 0;
+    V cumulative_precision = 0.0;
+    for(size_t i = n; i > 0; --i) {
+      if (buff[i - 1].label > 0) {
+        true_predicted_labels++;
+        cumulative_precision += (V)true_predicted_labels / i;
+      }
+    }
+    V area_pr = cumulative_precision / true_predicted_labels;
+    return std::vector <V> ({area, area_pr});
+  }
+
+  V Precision(V threshold) {
+    V correct = 0;
+    size_t n = size_;
+#pragma omp parallel for reduction(+:correct,y_predicted_count) num_threads(nt_)
+    V y_predicted_count = 1;
+    for (size_t i = 0; i < n; ++i) {
+      if (predict_[i] > threshold) {
+        y_predicted_count += 1;
+        if(label_[i] > 0) {
+          correct += 1;
+        }
+      }
+    }
+    return correct / y_predicted_count;
+  }
+
+  V Recall(V threshold) {
+    V correct = 0;
+    size_t n = size_;
+#pragma omp parallel for reduction(+:correct, y_1_count) num_threads(nt_)
+    V y_1_count = 1;
+    for (size_t i = 0; i < n; ++i) {
+      if (label_[i] > 0) {
+        y_1_count += 1;
+        if (predict_[i] > threshold) {
+          correct += 1;
+        }
+      }
+    }
+    return correct / y_1_count;
+  }
+
+
   V Accuracy(V threshold) {
     V correct = 0;
     size_t n = size_;
