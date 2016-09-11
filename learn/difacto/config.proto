@@ -60,10 +60,7 @@ message Config {
       ADAGRAD_V = 2;
 
       /// FTRL with incremental adaptive multiplycation by factor of minibatch occurencies of this feature
-      FTRL_V = 3;
-
-      /// FTRL-DMLC Style
-      FTRL_dmlc = 4;
+      FTRL = 3;
 
       // RMSProp learning rates with proximal l1 and l2 updates
       RMSProp = 5;
@@ -78,7 +75,7 @@ message Config {
       MOMENTUM = 8;
 
       // FTRL with RMSProp learning rates
-      FTRL_dmlc_RMSProp = 9;
+      FTRL_RMSProp = 9;
 
       // Nesterov Accelerated gradient with double proximal operator
       NAG_prox_momentum = 10;
@@ -90,10 +87,10 @@ message Config {
       NADAM_prox_momentum = 12;
 
       //FTRL-Proximal with adam updates
-      FTRL_dmlc_adam = 13;
+      FTRL_adam = 13;
 
       //FTRL-Proximal with nadam updates
-      FTRL_dmlc_nadam = 14;
+      FTRL_nadam = 14;
   }
 
     optional Algo_V algo_v = 151 [default = ADAGRAD_V];
@@ -109,6 +106,9 @@ message Config {
 
     /// l2 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
     optional float lambda_l2 = 3;
+
+    /// Incremental l2 regularizer for V
+    optional float lambda_l2_incremental = 16 [default = 0];
 
     /// -- learning --
 
@@ -133,11 +133,17 @@ message Config {
     /// normalized the l2-norm of gradient of :math:`V`. no in default
     optional float grad_normalization = 9 [default = 0];
 
-    /// l2 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
+    /// l1 regularizer for :math:`V`: :math:`\lambda_2 \|V_i\|_2^2`
     optional float lambda_l1 = 10  [default = 0];
+
+    /// l1 incremental regularizer (makes sense only when l1/2 is inactive)
+    optional float lambda_l1_incremental = 17 [default = 0];
 
     /// l1/2 regularizer for :math:`V`, may be used instead (or with) l1 shrinking heuristic
     optional float lambda_l1_2 = 11 [default = 0];
+
+    /// Incremental l1/2 regularizer for V
+    optional float lambda_l1_2_incremental = 18 [default = 0];
 
     /// learning rate momentum (for RMSProp & Adam)
     optional float lr_nu = 12 [default = 0.999];
@@ -145,7 +151,7 @@ message Config {
     /// momentum for cumulative gradients (for all momentum methods)
     optional float momentum_mu = 13 [default = 0.9];
 
-    /// group sparsity only for rate embeddings (recommended)
+    /// group sparsity only for rare embeddings (recommended)
     optional bool l1_2_only_small = 15 [default = true];
   }
 

@@ -102,10 +102,11 @@ struct ISGDHandle {
         Config::Embedding::Algo_V algo_v = Config::Embedding::ADAGRAD_V;
         int dim = 0;
         unsigned thr, thr_step;
-        float lambda_l1 = 0, lambda_l2 = 0;
+        float lambda_l1 = 0, lambda_l1_incremental = 0;
+        float lambda_l2 = 0, lambda_l2_incremental = 0;
         float alpha = .01, beta = 1;
         float V_min = -0.01f, V_max = .01;
-        float lambda_l1_2 = 0;
+        float lambda_l1_2 = 0, lambda_l1_2_incremental = 0;
         float lr_nu = 0.999;
         float momentum_mu = 0.9;
         bool l1_2_only_small = true;
@@ -364,22 +365,12 @@ struct AdaGradHandle : public ISGDHandle {
                 }
             }
 
-            if (val.size == V.dim + 1) {
-                for (int j = 1; j < val.size; ++j) {
-                    val.w[j] = rand() / (float) RAND_MAX * (V.V_max - V.V_min) + V.V_min;
-                    val.sqc_grad[j + 1] = 0;
-                    if (val.z_V) {
-                        val.z_V[j - 1] = 0.0;
-                    }
-                    if (val.nag_prev) {
-                        val.nag_prev[j - 1] = 0.0;
-                    }
-                }
-
-                // this should be consistent with prevous setting
-                if(V.l1_2_only_small) {
-                    new_V += V.dim;
-                }
+            // We add all embedding if it was not active and add only new weights if it was
+            if(val.is_active_embedding) {
+                new_V += val.size - old_siz;
+            } else {
+                new_V += val.size - 1;
+                val.is_active_embedding = true;
             }
         }
     }
@@ -532,12 +523,9 @@ struct AdaGradHandle : public ISGDHandle {
             adagrad_linearized_UpdateV(val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1);
         } else if (V.algo_v == Config::Embedding::ADAGRAD_V) {
             adagrad_proximal_UpdateV(val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1);
-        } else if (V.algo_v == Config::Embedding::FTRL_V) {
+        } else if (V.algo_v == Config::Embedding::FTRL) {
             ftrl_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
-                         val.minibatch_occurence_count, val.size, &val.is_active_embedding);
-        } else if (V.algo_v == Config::Embedding::FTRL_dmlc) {
-            ftrl_dmlc_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
-                              val.minibatch_occurence_count, val.size, &val.is_active_embedding);
+                         val.minibatch_occurence_count, &val.is_active_embedding);
         } else if (V.algo_v == Config::Embedding::RMSProp) {
             val.lr_nu_power *= V.lr_nu;
             rmsprop_UpdateV(val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.lr_nu_power);
@@ -554,7 +542,7 @@ struct AdaGradHandle : public ISGDHandle {
         } else if (V.algo_v == Config::Embedding::MOMENTUM) {
             val.momentum_mu_power *= V.momentum_mu;
             momentum_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1, val.momentum_mu_power);
-        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_RMSProp) {
+        } else if (V.algo_v == Config::Embedding::FTRL_RMSProp) {
             val.lr_nu_power *= V.lr_nu;
             ftrl_rmsprop_UpdateV(val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
                                  val.minibatch_occurence_count, val.lr_nu_power,
@@ -568,13 +556,13 @@ struct AdaGradHandle : public ISGDHandle {
             val.lr_nu_power *= V.lr_nu;
             nadam_reverse_prox_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
                                        val.momentum_mu_power, val.lr_nu_power);
-        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_adam) {
+        } else if (V.algo_v == Config::Embedding::FTRL_adam) {
             val.momentum_mu_power *= V.momentum_mu;
             val.lr_nu_power *= V.lr_nu;
             ftrl_adam_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
                               val.minibatch_occurence_count, val.momentum_mu_power,
                               val.lr_nu_power, &val.is_active_embedding);
-        } else if (V.algo_v == Config::Embedding::FTRL_dmlc_nadam) {
+        } else if (V.algo_v == Config::Embedding::FTRL_nadam) {
             val.momentum_mu_power *= V.momentum_mu;
             val.lr_nu_power *= V.lr_nu;
             ftrl_nadam_UpdateV(val.nag_prev, val.z_V, val.w+1, val.sqc_grad+2, recv.data+1, recv.size-1,
@@ -730,7 +718,7 @@ struct AdaGradHandle : public ISGDHandle {
     // FIXME: Currently we store both z and w, but instead we can store only z
     // FIXME: Produces different learning curves in comparision with adagrad update. This is wrong!
     inline void ftrl_UpdateV(float* z_v, float *w, float* cg, float const* g, int n,
-                             unsigned minibatch_occurence, unsigned size, bool* active) {
+                                  unsigned minibatch_occurence, bool* active) {
         for (int i = 0; i < n; i++) {
             float grad = g[i];
             float cg_old = cg[i];
@@ -739,38 +727,9 @@ struct AdaGradHandle : public ISGDHandle {
             cg[i] = cg_new;
         }
 
-        float l1 = V.lambda_l1 * minibatch_occurence;
-        float l2 = V.lambda_l2 * minibatch_occurence;
-        float l1_2 = V.lambda_l1_2 * minibatch_occurence;
-
-
-        // fail, because to the moment
-        if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
-            auto res_w = solve_proximal_operator_group(z_v, cg, l1, l2, l1_2, n, active);
-            for (int i = 0; i < n; i++) {
-                w[i] = res_w[i];
-            }
-        } else {
-            for (int i = 0; i < n; i++) {
-                w[i] = solve_proximal_operator(- z_v[i], V.alpha / (cg[i] + V.beta), l1, l2);
-            }
-        }
-    }
-
-    // FTRL-DMLC Proximal update
-    inline void ftrl_dmlc_UpdateV(float* z_v, float *w, float* cg, float const* g, int n,
-                                  unsigned minibatch_occurence, unsigned size, bool* active) {
-        for (int i = 0; i < n; i++) {
-            float grad = g[i];
-            float cg_old = cg[i];
-            float cg_new = (float) sqrt(cg_old * cg_old + grad * grad);
-            z_v[i] += grad - (cg_new - cg_old) / V.alpha * w[i];
-            cg[i] = cg_new;
-        }
-
-        float l1 = V.lambda_l1;
-        float l2 = V.lambda_l2;
-        float l1_2 = V.lambda_l1_2;
+        float l1 = V.lambda_l1 + minibatch_occurence * V.lambda_l1_incremental;
+        float l2 = V.lambda_l2 + minibatch_occurence * V.lambda_l2_incremental;
+        float l1_2 = V.lambda_l1_2 + minibatch_occurence * V.lambda_l1_2_incremental;
 
 
         if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
@@ -805,9 +764,9 @@ struct AdaGradHandle : public ISGDHandle {
             z_v[i] += grad - (n_t_cur - n_t_prev) / V.alpha * w[i];
         }
 
-        float l1 = V.lambda_l1;
-        float l2 = V.lambda_l2;
-        float l1_2 = V.lambda_l1_2;
+        float l1 = V.lambda_l1 + minibatch_occurence * V.lambda_l1_incremental;
+        float l2 = V.lambda_l2 + minibatch_occurence * V.lambda_l2_incremental;
+        float l1_2 = V.lambda_l1_2 + minibatch_occurence * V.lambda_l1_2_incremental;
 
 
         if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
@@ -848,9 +807,9 @@ struct AdaGradHandle : public ISGDHandle {
         }
 
 
-        float l1 = V.lambda_l1;
-        float l2 = V.lambda_l2;
-        float l1_2 = V.lambda_l1_2;
+        float l1 = V.lambda_l1 + minibatch_occurence * V.lambda_l1_incremental;
+        float l2 = V.lambda_l2 + minibatch_occurence * V.lambda_l2_incremental;
+        float l1_2 = V.lambda_l1_2 + minibatch_occurence * V.lambda_l1_2_incremental;
 
 
         if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
@@ -896,9 +855,9 @@ struct AdaGradHandle : public ISGDHandle {
         }
 
 
-        float l1 = V.lambda_l1;
-        float l2 = V.lambda_l2;
-        float l1_2 = V.lambda_l1_2;
+        float l1 = V.lambda_l1 + minibatch_occurence * V.lambda_l1_incremental;
+        float l2 = V.lambda_l2 + minibatch_occurence * V.lambda_l2_incremental;
+        float l1_2 = V.lambda_l1_2 + minibatch_occurence * V.lambda_l1_2_incremental;
 
 
         if (V.lambda_l1_2 > 0 && (!V.l1_2_only_small || n < V.dim + 1)) {
@@ -938,7 +897,7 @@ public:
             h.V.thr         = (unsigned)c.threshold();
             h.V.thr_step    = (unsigned)c.threshold_step();
             h.V.lambda_l2   = c.lambda_l2();
-            h.V.lambda_l2   = c.lambda_l1();
+            h.V.lambda_l1   = c.lambda_l1();
             h.V.V_min       = - c.init_scale();
             h.V.V_max       = c.init_scale();
             h.V.alpha       = c.has_lr_eta() ? c.lr_eta() : h.alpha;
@@ -948,6 +907,10 @@ public:
             h.V.lr_nu       = c.lr_nu();
             h.V.momentum_mu = c.momentum_mu();
             h.V.l1_2_only_small = c.l1_2_only_small();
+
+            h.V.lambda_l2_incremental = c.lambda_l2_incremental();
+            h.V.lambda_l1_incremental = c.lambda_l1_incremental();
+            h.V.lambda_l1_2_incremental = c.lambda_l1_2_incremental();
         }
 
         Server s(h, 1, 1, ps::NextID(), conf_.max_keys());
