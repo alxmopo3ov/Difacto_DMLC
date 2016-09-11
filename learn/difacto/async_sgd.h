@@ -96,6 +96,7 @@ struct ISGDHandle {
     float lambda_l1 = 0, lambda_l2 = 0;
     float alpha = .01, beta = 1;
     Config::Algo_W algo_w = Config::FTRL_W;
+    float lr_nu_w = 0.999;
 
     // for V
     struct Embedding {
@@ -454,7 +455,7 @@ struct AdaGradHandle : public ISGDHandle {
     }
 
     inline void UpdateW_FTRL_dmlc_RMSProp(AdaGradEntry& val, float g, FeaID key) {
-        val.lr_nu_power_w *= V.lr_nu;
+        val.lr_nu_power_w *= lr_nu_w;
         float w = val.w_0();
 
         // temporary crutch for initial bias correction term
@@ -889,6 +890,7 @@ public:
         h.l1_shrk       = conf.l1_shrk();
         h.learn_bias_embedding = conf.learn_bias_embedding();
         h.algo_w        = conf.algo_w();
+        h.lr_nu_w       = conf.lr_nu_w();
 
         // for V
         if (conf.embedding_size() > 0) {

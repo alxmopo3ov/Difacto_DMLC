@@ -171,6 +171,9 @@ message Config {
     // FTRL_dmlc_nadam = 6;
   }
 
+  /// Learning rate decay for RMSProp
+  optional float lr_nu_w = 151 [default = 0.999];
+
   /// the learning method, default is FTRL
   optional Algo_W algo_w = 150 [default = FTRL_W];
 
